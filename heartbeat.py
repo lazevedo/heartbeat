@@ -6,21 +6,30 @@ import time
 import yaml
 
 DATETIME_FORMAT = '%m/%d %H:%M'
-
+DATETIME_FORMAT_LONG = '%Y/%m/%d %H:%M'
 
 def format_now():
     return datetime.datetime.now().strftime(DATETIME_FORMAT)
 
+def format_now_long():
+    return datetime.datetime.now().strftime(DATETIME_FORMAT_LONG)
 
 class Test:
     def __init__(self, owner, config):
         self.owner = owner
         self.config = config
         self.id = hashlib.sha256(json.dumps(config).encode()).hexdigest()
-        self.down_message = config.setdefault('down_message', '$name is down, since $last_pass_time')
-        self.up_message = config.setdefault('up_message', '$name is up')
+        self.down_message = config.setdefault(
+            'down_message',
+            '[$time] Resource: `$name` is down. $last_pass_message'
+        )
+        # TODO: improve up message
+        self.up_message = config.setdefault(
+            'up_message',
+            '[$time] Resource: `$name` is up.'
+        )
         self.ignore_fail_count = config.setdefault('ignore_fail_count', 0)
-        self.alert_period_hours = config.setdefault('alert_period_hours', 1.0)
+        self.alert_period_seconds = config.setdefault('alert_period_seconds', 5)
 
     def get(self, key, default=None):
         if not self.id in self.owner.state:
@@ -32,6 +41,13 @@ class Test:
             self.owner.state[self.id] = {}
         self.owner.state[self.id][key] = value
 
+    def last_pass_message(self):
+        print(self.get('last_pass_time'))
+        if self.get('last_pass_time'):
+            return 'Last successful check at ' + self.get('last_pass_time') + '.'
+        else:
+            return 'Failure first detected at ' + self.get('first_fail_since_pass') + '.'
+
     def expand_message(self, message):
         for key, value in self.config.items():
             message = message.replace('$' + key, str(value))
@@ -39,14 +55,22 @@ class Test:
             self.owner.state[self.id] = {}
         for key, value in self.owner.state[self.id].items():
             message = message.replace('$' + key, str(value))
+        if '$time' in message:
+            message = message.replace('$time', format_now_long())
+        if '$last_pass_message' in message:
+            message = message.replace('$last_pass_message', self.last_pass_message())
+
         return message
 
     def do_pass(self):
+        print(self.get('state'))
         if self.get('state') != 'passing':
             self.owner.notify(self.expand_message(self.up_message))
             self.set('state', 'passing')
             self.set('first_pass_time', format_now())
             self.set('last_fail_alert_time', 0)
+            self.set('first_fail_since_pass', 0)
+
         self.set('name', self.config['name'])
         self.set('last_pass_time', format_now())
         self.set('fail_count', 0)
@@ -55,15 +79,21 @@ class Test:
         fail_count = self.get('fail_count', 0) + 1
         self.set('name', self.config['name'])
         self.set('fail_count', fail_count)
+
         if fail_count > self.ignore_fail_count:
             if self.get('state') != 'failing':
                 self.set('state', 'failing')
                 self.set('first_fail_time', format_now())
+                self.set('first_fail_since_pass', format_now())
+                print(self.get('first_fail_since_pass'))
+
             alert_time = time.time()
-            last_alert_fail_time = self.get('last_fail_alert_time', 0)
-            if alert_time - last_alert_fail_time >= self.alert_period_hours * 60 * 60:
+            last_fail_alert_time = self.get('last_fail_alert_time', 0)
+
+            if alert_time - last_fail_alert_time >= self.alert_period_seconds:
                 self.set('last_fail_alert_time', alert_time)
                 self.owner.notify(self.expand_message(self.down_message))
+
         self.set('last_fail_time', format_now())
 
 
@@ -122,10 +152,6 @@ class HTTPTest(Test):
         except Exception as e:
             self.do_fail()
 
-
-TEST_PROVIDERS = [('shell', ShellTest), ('tcp', TCPTest), ('http', HTTPTest)]
-
-
 class Alert:
     def __init__(self, config):
         pass
@@ -158,9 +184,17 @@ class TwilioAlert(Alert):
         client.api.account.messages.create(
             to=self.to_number, from_=self.from_number, body=message)
 
+class SlackAlert(Alert):
+    def __init__(self, config):
+        super().__init__(config)
+        self.slack_api_token = config['slack_api_token']
+        self.channel = config['channel']
 
-ALERT_PROVIDERS = [('shell', ShellAlert), ('twilio', TwilioAlert)]
-
+    def send(self, message):
+        import slack
+        client = slack.WebClient(token=self.slack_api_token)
+        print(message)
+        response = client.chat_postMessage(channel=self.channel, text=message)
 
 class Heartbeat:
     def __init__(self):
@@ -211,6 +245,10 @@ class Heartbeat:
         self.test()
         self.save_state()
 
+TEST_PROVIDERS = [('shell', ShellTest), ('tcp', TCPTest), ('http', HTTPTest)]
+ALERT_PROVIDERS = [
+    ('shell', ShellAlert), ('slack', SlackAlert), ('twilio', TwilioAlert)
+]
 
 if __name__ == '__main__':
     heartbeat = Heartbeat()

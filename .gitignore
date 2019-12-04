@@ -1,1 +1,6 @@
 .vscode
+.heartbeat.json
+heartbeat.yaml
+*.swp
+*.swo
+*.swn
